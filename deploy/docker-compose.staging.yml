@@ -1,0 +1,47 @@
+# Staging environment used by the CI/CD pipeline.
+#
+# It runs the exact image that was built and scanned in the `docker` job
+# (IMAGE=ghcr.io/<owner>/<repo>:<commit sha>) together with fresh PostgreSQL
+# and Redis containers, so smoke tests run against the real release candidate.
+# No hardware is attached: SERIAL_PORT=/dev/null makes the server fall back
+# to replaying stored sensor data.
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: sedentary
+      POSTGRES_PASSWORD: ${STAGING_DB_PASSWORD:?set STAGING_DB_PASSWORD}
+      POSTGRES_DB: sedentary_tracker
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sedentary"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  app:
+    image: ${IMAGE:?set IMAGE to the image built in the docker job}
+    environment:
+      DATABASE_URL: postgres://sedentary:${STAGING_DB_PASSWORD}@db:5432/sedentary_tracker
+      REDIS_URL: redis://redis:6379/
+      SERIAL_PORT: /dev/null
+      BAUD_RATE: "115200"
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
+      FRONTEND_DIR: /app/frontend
+      FALLBACK_TIMEOUT_SECONDS: "5"
+      RUST_LOG: info
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
