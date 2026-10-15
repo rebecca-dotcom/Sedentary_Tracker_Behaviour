@@ -1,8 +1,6 @@
 import psycopg2
 import pandas as pd
-import numpy as np
 from sklearn.cluster import KMeans
-from datetime import datetime
 import os
 
 # Environment variables
@@ -77,7 +75,8 @@ def run_analysis():
         score = int((active_mins / total_mins) * 100) if total_mins > 0 else 0
         
         dominant_state = "SEDENTARY"
-        if active_mins > sedentary_mins: dominant_state = "ACTIVE"
+        if active_mins > sedentary_mins:
+            dominant_state = "ACTIVE"
 
         cursor = conn.cursor()
         cursor.execute("""
@@ -95,7 +94,8 @@ def run_analysis():
     except Exception as e:
         print(f" Error: {e}")
     finally:
-        if conn: conn.close()
+        if conn:
+            conn.close()
 
 if __name__ == "__main__":
     run_analysis()

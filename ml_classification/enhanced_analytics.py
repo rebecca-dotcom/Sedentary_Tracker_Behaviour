@@ -13,12 +13,11 @@ Features:
 
 import psycopg2
 import pandas as pd
-import numpy as np
 from sklearn.cluster import KMeans
 from datetime import datetime, timedelta
 import json
 import os
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 # Environment variables - Database
 DB_URL = os.environ.get("DATABASE_URL")
@@ -489,7 +488,7 @@ class SedentaryAnalytics:
                 df = self.load_user_data(user_id, hours=24)
 
                 if df.empty:
-                    print(f"   ⏭  Skipping - no data")
+                    print("   ⏭  Skipping - no data")
                     continue
 
                 # Calculate basic statistics
@@ -504,14 +503,14 @@ class SedentaryAnalytics:
                 # Calculate weekly summary (if it's Sunday)
                 if today.weekday() == 6:  # Sunday
                     week_start = today - timedelta(days=6)
-                    print(f"    Calculating weekly summary...")
+                    print("    Calculating weekly summary...")
                     self.calculate_weekly_summary(user_id, week_start)
 
                 # Calculate monthly summary (if it's last day of month)
                 tomorrow = today + timedelta(days=1)
                 if tomorrow.day == 1:
                     month_start = today.replace(day=1)
-                    print(f"    Calculating monthly summary...")
+                    print("    Calculating monthly summary...")
                     self.calculate_monthly_summary(user_id, month_start)
 
             print("\n" + "=" * 60)

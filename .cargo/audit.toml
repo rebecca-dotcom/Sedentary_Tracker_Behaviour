@@ -1,0 +1,13 @@
+# Configuration for `cargo audit` (dependency vulnerability gate in CI).
+#
+# Every ignored advisory must have a written reason here, so that accepting
+# a risk is a reviewed decision in git history, not a silent setting.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 - rsa: Marvin timing attack, no fixed version exists.
+    # The `rsa` crate is only pulled in by `sqlx-mysql`, which is listed in
+    # Cargo.lock but never compiled: this project uses the PostgreSQL driver
+    # only (`cargo tree -i rsa` returns nothing). Re-check when sqlx updates.
+    "RUSTSEC-2023-0071",
+]
