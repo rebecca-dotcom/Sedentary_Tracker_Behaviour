@@ -13,13 +13,13 @@ from datetime import datetime
 from typing import AsyncGenerator, Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # Import existing analytics
-from enhanced_analytics import SedentaryAnalytics, LOINC_CODE, LOINC_DISPLAY
+from enhanced_analytics import LOINC_CODE, LOINC_DISPLAY
 
 
 # =============================================================================

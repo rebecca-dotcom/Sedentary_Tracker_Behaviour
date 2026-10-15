@@ -1,0 +1,7 @@
+# Lint gate for the Python ML service.
+# E/F = pycodestyle errors and pyflakes (unused imports, undefined names, ...).
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = ["E", "F"]
