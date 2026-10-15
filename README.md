@@ -518,6 +518,30 @@ cargo clippy -- -D warnings
 cargo fmt -- --check && cargo clippy -- -D warnings && cargo test -p logic -p errors
 ```
 
+### CI/CD Pipeline (GitHub Actions)
+
+Defined in `.github/workflows/ci.yml`. Pull requests run stages 1–3; pushes to `main` run all five.
+
+| Stage | Jobs | Blocks the release when |
+|-------|------|-------------------------|
+| 1 Verify | Lint & format, unit tests with coverage gate, DB integration tests, ML service checks, PR traceability | Formatting, Clippy or ruff errors; failing tests; coverage below `COVERAGE_MIN`; PR without an issue reference |
+| 2 Secure | `cargo audit`, gitleaks secret scan, health-data check | Known vulnerable dependency; committed secret; personal data in committed files |
+| 3 Package | Build image once, Trivy scan, SBOM, push to GHCR | HIGH/CRITICAL fixable vulnerability in the image |
+| 4 Staging | Deploy the scanned image with PostgreSQL + Redis, smoke tests | Service not healthy; protected endpoints reachable without a valid token |
+| 5 Production | Manual approval, promote the same image to the `production` tag, optional deploy hook | Reviewer does not approve |
+
+Accepted risks are documented next to the code: `.cargo/audit.toml` (dependency advisories) and `.gitleaksignore` (secret-scan false positives).
+
+Run the extra checks locally:
+
+```bash
+python3 scripts/check_health_data.py              # health-data check
+cd ml_classification && ruff check . && pytest tests  # ML service
+scripts/smoke_test.sh http://localhost:8000        # against a running server
+```
+
+**Repository setup:** under *Settings → Environments*, create `staging` and `production` and add a required reviewer to `production`. Optionally add a `PRODUCTION_DEPLOY_HOOK` secret for your hosting provider.
+
 ---
 
 ## Development Scripts

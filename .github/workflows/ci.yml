@@ -1,16 +1,37 @@
 name: CI/CD
 
+# Pipeline overview
+#   Stage 1  Verify      lint, unit tests + coverage gate, DB integration tests,
+#                        ML service checks, traceability (pull requests)
+#   Stage 2  Secure      dependency audit, secret scan, health-data check
+#   Stage 3  Package     build image once, Trivy scan, SBOM, push (main only)
+#   Stage 4  Staging     deploy the scanned image with PostgreSQL + Redis, smoke tests
+#   Stage 5  Production  manual approval, promote the same image, deploy hook
+#
+# Pull requests run stages 1-3 (without pushing). Pushes to main run all stages.
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   SQLX_OFFLINE: true
+  # Minimum line coverage for the Rust unit tests. Measured baseline: 20.2 %
+  # (tarpaulin). The gate sits just below it to allow for small differences
+  # between Rust versions.
+  # Raise this number as tests are added, never lower it.
+  COVERAGE_MIN: 19
 
 jobs:
+  # ---------------------------------------------------------------- Stage 1
   lint:
     name: Lint & Format
     runs-on: ubuntu-latest
@@ -46,7 +67,7 @@ jobs:
         run: cargo clippy --workspace --exclude db --all-targets -- -D warnings
 
   test:
-    name: Unit Tests
+    name: Unit Tests & Coverage
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -71,35 +92,45 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-test-
 
-      - name: Run unit tests (errors crate)
-        run: cargo test -p errors
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
 
-      - name: Run unit tests (logic crate)
-        run: cargo test -p logic
+      - name: Run unit tests with coverage gate
+        run: >
+          cargo tarpaulin -p errors -p logic -p server
+          --skip-clean --out Xml --out Html --output-dir coverage
+          --fail-under ${{ env.COVERAGE_MIN }}
 
-      - name: Run unit tests (server crate)
-        run: cargo test -p server
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
 
   test-db:
     name: Database Integration Tests
     runs-on: ubuntu-latest
     env:
       SQLX_OFFLINE: false
-      POSTGRES_USER: ${{ vars.POSTGRES_USER }}
-      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-      POSTGRES_DB: ${{ vars.POSTGRES_DB }}
-      POSTGRES_HOST: ${{ vars.POSTGRES_HOST }}
-      POSTGRES_PORT: ${{ vars.POSTGRES_PORT }}
+      # Repository variables are used when set; otherwise CI-only defaults.
+      POSTGRES_USER: ${{ vars.POSTGRES_USER || 'sedentary' }}
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD || 'ci-test-only' }}
+      POSTGRES_DB: ${{ vars.POSTGRES_DB || 'sedentary_tracker' }}
+      POSTGRES_HOST: ${{ vars.POSTGRES_HOST || 'localhost' }}
+      POSTGRES_PORT: ${{ vars.POSTGRES_PORT || '5432' }}
 
     services:
       postgres:
         image: postgres:15-alpine
         env:
-          POSTGRES_USER: ${{ vars.POSTGRES_USER }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-          POSTGRES_DB: ${{ vars.POSTGRES_DB }}
+          POSTGRES_USER: ${{ vars.POSTGRES_USER || 'sedentary' }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD || 'ci-test-only' }}
+          POSTGRES_DB: ${{ vars.POSTGRES_DB || 'sedentary_tracker' }}
         ports:
-          - ${{ vars.POSTGRES_PORT }}:5432
+          - ${{ vars.POSTGRES_PORT || '5432' }}:5432
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -133,11 +164,11 @@ jobs:
 
       - name: Set DATABASE_URL
         run: |
-          echo "DATABASE_URL=postgres://${{ vars.POSTGRES_USER }}:${{ secrets.POSTGRES_PASSWORD }}@${{ vars.POSTGRES_HOST }}:${{ vars.POSTGRES_PORT }}/${{ vars.POSTGRES_DB }}" >> $GITHUB_ENV
+          echo "DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}" >> "$GITHUB_ENV"
 
       - name: Wait for PostgreSQL
         run: |
-          until pg_isready -h ${{ vars.POSTGRES_HOST }} -p ${{ vars.POSTGRES_PORT }} -U ${{ vars.POSTGRES_USER }}; do
+          until pg_isready -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER"; do
             echo "Waiting for PostgreSQL..."
             sleep 2
           done
@@ -154,44 +185,231 @@ jobs:
       - name: Run database integration tests
         run: cargo test -p db
 
-  docker:
-    name: Build & Push Docker Image
+  ml-service:
+    name: ML Service Checks (Python)
     runs-on: ubuntu-latest
-    needs: [lint, test, test-db]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    permissions:
-      contents: read
-      packages: write
-
+    defaults:
+      run:
+        working-directory: ml_classification
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: ml_classification/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest httpx==0.27.2 ruff bandit
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Unit tests (pytest)
+        run: pytest -q --junitxml=pytest-report.xml tests
+
+      - name: Security scan (bandit, blocks on high severity)
+        run: |
+          bandit -r . -x ./tests -f json -o bandit-report.json || true
+          bandit -r . -x ./tests --severity-level high
+
+      - name: Upload ML reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ml-service-reports
+          path: |
+            ml_classification/pytest-report.xml
+            ml_classification/bandit-report.json
+
+  traceability:
+    name: Traceability (PR references an issue)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check that the pull request links a backlog item
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if printf '%s\n%s' "$PR_TITLE" "$PR_BODY" | grep -qE '#[0-9]+'; then
+            echo "Pull request references a backlog item:"
+            printf '%s\n%s' "$PR_TITLE" "$PR_BODY" | grep -oE '#[0-9]+' | sort -u
+          else
+            echo "::error::Reference the GitHub issue this change belongs to (e.g. 'Closes #12') in the PR title or description."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------- Stage 2
+  security:
+    name: Security & Health-Data Checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code (full history for the secret scan)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Dependency vulnerability audit (RustSec)
+        # Accepted risks are documented in .cargo/audit.toml
+        run: cargo audit
+
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Health-data protection check
+        run: python3 scripts/check_health_data.py
+
+  # ---------------------------------------------------------------- Stage 3
+  docker:
+    name: Build, Scan & Push Image
+    runs-on: ubuntu-latest
+    needs: [lint, test, test-db, ml-service, security]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.name.outputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Image name (registry names must be lowercase)
+        id: name
+        run: |
+          repo="${GITHUB_REPOSITORY,,}"
+          echo "image=ghcr.io/${repo}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "latest=ghcr.io/${repo}:latest" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata for Docker
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=latest
-            type=sha,prefix=
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+      - name: Build image once (tagged with the commit SHA)
+        uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          load: true
+          tags: ${{ steps.name.outputs.image }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Security tools are pinned to a full commit SHA, not a tag: in March 2026
+      # the trivy-action tags 0.0.1-0.34.2 were hijacked to steal CI secrets
+      # (CVE-2026-33634). 0.35.0 was not affected.
+      - name: Container vulnerability scan (Trivy, blocks on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          image-ref: ${{ steps.name.outputs.image }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Software bill of materials (CycloneDX)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          image-ref: ${{ steps.name.outputs.image }}
+          format: cyclonedx
+          output: sbom.cdx.json
+          skip-setup-trivy: true
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+
+      - name: Push image to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag "${{ steps.name.outputs.image }}" "${{ steps.name.outputs.latest }}"
+          docker push "${{ steps.name.outputs.image }}"
+          docker push "${{ steps.name.outputs.latest }}"
+
+  # ---------------------------------------------------------------- Stage 4
+  deploy-staging:
+    name: Deploy to Staging & Smoke Test
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: staging
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE: ${{ needs.docker.outputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Pull the scanned release candidate
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "$IMAGE"
+
+      - name: Start staging environment
+        run: |
+          export STAGING_DB_PASSWORD="$(openssl rand -hex 16)"
+          export JWT_SECRET="$(openssl rand -hex 32)"
+          docker compose -f deploy/docker-compose.staging.yml up -d
+
+      - name: Smoke tests
+        run: bash scripts/smoke_test.sh http://localhost:8000
+
+      - name: Show application logs on failure
+        if: failure()
+        run: docker compose -f deploy/docker-compose.staging.yml logs app
+
+      - name: Stop staging environment
+        if: always()
+        run: docker compose -f deploy/docker-compose.staging.yml down -v
+        env:
+          STAGING_DB_PASSWORD: unused
+          JWT_SECRET: unused
+
+  # ---------------------------------------------------------------- Stage 5
+  deploy-production:
+    name: Release to Production
+    runs-on: ubuntu-latest
+    needs: [docker, deploy-staging]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Add yourself as a required reviewer under
+    # Settings -> Environments -> production, so this job waits for approval.
+    environment:
+      name: production
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ${{ needs.docker.outputs.image }}
+      DEPLOY_HOOK: ${{ secrets.PRODUCTION_DEPLOY_HOOK }}
+    steps:
+      - name: Promote the tested image (same digest, new tag)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "$IMAGE"
+          production="${IMAGE%:*}:production"
+          docker tag "$IMAGE" "$production"
+          docker push "$production"
+          echo "Released $IMAGE as $production" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Trigger hosting provider deploy
+        run: |
+          if [ -z "$DEPLOY_HOOK" ]; then
+            echo "::notice::No PRODUCTION_DEPLOY_HOOK secret set; the image was promoted in the registry only."
+            exit 0
+          fi
+          curl -fsS -X POST "$DEPLOY_HOOK"

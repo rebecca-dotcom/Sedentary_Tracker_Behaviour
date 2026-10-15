@@ -1,0 +1,7 @@
+# Accepted gitleaks findings. Each entry needs a reason.
+#
+# DOCUMENTATION.md line 847: a truncated example login response in the API docs.
+# The value is only the base64 form of the standard JWT header (alg HS256) and is
+# cut off with "...", so it is not a usable credential.
+8acf0acd30e80ff272e7e22806f1a4320256fcd7:DOCUMENTATION.md:generic-api-key:847
+DOCUMENTATION.md:generic-api-key:847

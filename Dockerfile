@@ -32,8 +32,11 @@ RUN cargo build --release
 # Stage 4: Final Image
 FROM debian:bookworm-slim
 WORKDIR /app
-# Install only necessary runtime dependencies
-RUN apt-get update && apt-get install -y libudev-dev postgresql-client curl && rm -rf /var/lib/apt/lists/*
+# Install only necessary runtime dependencies, with the latest security patches
+# of the base image (keeps the Trivy scan in CI clean of already-fixed CVEs)
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends libudev-dev postgresql-client curl \
+    && rm -rf /var/lib/apt/lists/*
 # Copy build artifacts from the builder stage
 COPY --from=builder /workspace/target/release/server /app/server
 COPY ./frontend /app/frontend
