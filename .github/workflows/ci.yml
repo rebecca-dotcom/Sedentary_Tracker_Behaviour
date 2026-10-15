@@ -15,6 +15,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # "edited" re-runs the checks when the PR description changes, e.g. after
+    # adding the issue reference that the traceability job requires.
+    types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
 
 concurrency:
